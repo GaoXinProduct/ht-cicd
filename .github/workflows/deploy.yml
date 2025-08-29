@@ -1,0 +1,200 @@
+name: acme申请证书自动上传到阿里云cdn
+
+on:
+  schedule:
+    - cron: '0 8 1 * *'  # 每月1号上午8点执行
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  renew-and-deploy-certs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        
+      - name: 安装acme.sh
+        run: |
+          curl https://get.acme.sh | sh -s email=${{ secrets.ACME_EMAIL || 'ht@example.com' }}
+          echo "$HOME/.acme.sh" >> $GITHUB_PATH
+          
+      - name: 一次性申请所有域名的SSL证书
+        env:
+          Ali_Key: ${{ secrets.ALI_KEY }}
+          Ali_Secret: ${{ secrets.ALI_SECRET }}
+        run: |   
+          # 从 secrets 读取域名配置
+          CERT_DOMAINS="${{ secrets.CERT_DOMAINS }}"
+          
+          if [ -z "$CERT_DOMAINS" ]; then
+            echo "错误: 请在 secrets 中配置 CERT_DOMAINS"
+            exit 1
+          fi
+          
+          echo "开始一次性申请所有域名的SSL证书"
+          echo "域名配置: $CERT_DOMAINS"
+          echo "使用 CA: ZeroSSL (默认)"
+          echo ""
+          
+          # 将所有域名转换为 -d 参数格式
+          ALL_DOMAIN_ARGS=""
+          PRIMARY_DOMAIN=""
+          DOMAIN_COUNT=0
+          
+          # 处理域名配置，支持空格和|分隔
+          ALL_DOMAINS=$(echo "$CERT_DOMAINS" | sed 's/|/ /g')
+          
+          for domain in $ALL_DOMAINS; do
+            domain=$(echo "$domain" | xargs)
+            
+            if [ -z "$domain" ]; then
+              continue
+            fi
+            
+            # 第一个域名作为主域名
+            if [ -z "$PRIMARY_DOMAIN" ]; then
+              PRIMARY_DOMAIN="$domain"
+              ALL_DOMAIN_ARGS="-d $domain"
+            else
+              ALL_DOMAIN_ARGS="$ALL_DOMAIN_ARGS -d $domain"
+            fi
+            
+            DOMAIN_COUNT=$((DOMAIN_COUNT + 1))
+            echo "添加域名: $domain"
+          done
+          
+          echo ""
+          echo "========================================"
+          echo "准备申请证书"
+          echo "主域名: $PRIMARY_DOMAIN"
+          echo "域名总数: $DOMAIN_COUNT"
+          echo "完整命令参数: $ALL_DOMAIN_ARGS"
+          echo "========================================"
+          echo ""
+          
+          # 一次性申请所有域名的证书
+          echo "执行证书申请命令..."
+          if ~/.acme.sh/acme.sh --issue --dns dns_ali $ALL_DOMAIN_ARGS; then
+            echo "✅ 所有域名证书申请成功！"
+            echo "CERT_SUCCESS=true" >> $GITHUB_ENV
+            echo "PRIMARY_DOMAIN=$PRIMARY_DOMAIN" >> $GITHUB_ENV
+          elif ~/.acme.sh/acme.sh --renew -d "$PRIMARY_DOMAIN" --force; then
+            echo "✅ 证书强制续期成功！"
+            echo "CERT_SUCCESS=true" >> $GITHUB_ENV
+            echo "PRIMARY_DOMAIN=$PRIMARY_DOMAIN" >> $GITHUB_ENV
+          else
+            echo "❌ 证书申请失败！"
+            echo "CERT_SUCCESS=false" >> $GITHUB_ENV
+            exit 1
+          fi
+          
+      - name: 一次性上传证书到阿里云CDN
+        if: env.CERT_SUCCESS == 'true'
+        env:
+          DEPLOY_ALI_CDN_ACCESS_KEY_ID: ${{ secrets.ALI_KEY }}
+          DEPLOY_ALI_CDN_ACCESS_KEY_SECRET: ${{ secrets.ALI_SECRET }}
+          DEPLOY_ALI_CDN_DOMAIN: ${{ secrets.CDN_DOMAINS }}
+        run: |
+          CDN_DOMAINS="${{ secrets.CDN_DOMAINS }}"
+          PRIMARY_DOMAIN="${{ env.PRIMARY_DOMAIN }}"
+          
+          if [ -z "$CDN_DOMAINS" ]; then
+            echo "错误: 请在 secrets 中配置 CDN_DOMAINS"
+            exit 1
+          fi
+          
+          if [ -z "$PRIMARY_DOMAIN" ]; then
+            echo "错误: 没有找到主域名"
+            exit 1
+          fi
+          
+          echo "========================================"
+          echo "开始上传证书到阿里云CDN"
+          echo "主域名: $PRIMARY_DOMAIN"
+          echo "CDN域名配置: $CDN_DOMAINS"
+          echo "========================================"
+          echo ""
+          
+          # 直接部署到CDN，acme.sh会自动处理证书文件
+          echo "执行CDN部署命令..."
+          if ~/.acme.sh/acme.sh --deploy -d "$PRIMARY_DOMAIN" --deploy-hook ali_cdn; then
+            echo "✅ 证书成功上传到阿里云CDN！"
+            echo "CDN_DEPLOY_SUCCESS=true" >> $GITHUB_ENV
+          else
+            echo "❌ 证书上传到CDN失败！"
+            echo "CDN_DEPLOY_SUCCESS=false" >> $GITHUB_ENV
+            exit 1
+          fi
+          
+      - name: 检查最终状态
+        if: always()
+        run: |
+          echo "========================================"
+          echo "任务执行完成 - 最终状态检查"
+          echo "========================================"
+          echo ""
+          echo "=== 证书列表 ==="
+          ~/.acme.sh/acme.sh --list || echo "获取证书列表失败"
+          echo ""
+          echo "=== 环境变量检查 ==="
+          echo "CERT_SUCCESS: ${{ env.CERT_SUCCESS }}"
+          echo "CDN_DEPLOY_SUCCESS: ${{ env.CDN_DEPLOY_SUCCESS }}"
+          echo "PRIMARY_DOMAIN: ${{ env.PRIMARY_DOMAIN }}"
+                    
+      - name: 发送通知
+        if: always()
+        env:
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+        run: |
+          CERT_SUCCESS="${{ env.CERT_SUCCESS }}"
+          CDN_DEPLOY_SUCCESS="${{ env.CDN_DEPLOY_SUCCESS }}"
+          PRIMARY_DOMAIN="${{ env.PRIMARY_DOMAIN }}"
+          JOB_STATUS="${{ job.status }}"
+          
+          if [ "$JOB_STATUS" == "success" ] && [ "$CERT_SUCCESS" == "true" ] && [ "$CDN_DEPLOY_SUCCESS" == "true" ]; then
+            STATUS="✅ 完全成功"
+            MESSAGE="SSL证书一次性申请和CDN一次性部署全部成功"
+            EMOJI="🎉"
+          elif [ "$CERT_SUCCESS" == "true" ] && [ "$CDN_DEPLOY_SUCCESS" != "true" ]; then
+            STATUS="⚠️ 部分成功"
+            MESSAGE="SSL证书申请成功，但CDN部署失败"
+            EMOJI="⚠️"
+          elif [ "$CERT_SUCCESS" != "true" ]; then
+            STATUS="❌ 申请失败"
+            MESSAGE="SSL证书申请失败"
+            EMOJI="💥"
+          else
+            STATUS="❌ 失败"
+            MESSAGE="任务执行过程中出现未知错误"
+            EMOJI="🚨"
+          fi
+          
+          TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S UTC')
+          
+          # 构建域名信息
+          DOMAIN_INFO=""
+          if [ -n "$PRIMARY_DOMAIN" ]; then
+            CERT_DOMAINS="${{ secrets.CERT_DOMAINS }}"
+            ALL_DOMAINS=$(echo "$CERT_DOMAINS" | sed 's/|/ /g')
+            DOMAIN_COUNT=$(echo $ALL_DOMAINS | wc -w)
+            DOMAIN_INFO="\n- **主域名**: $PRIMARY_DOMAIN\n- **域名总数**: $DOMAIN_COUNT 个"
+          fi
+          
+          CDN_INFO=""
+          if [ -n "${{ secrets.CDN_DOMAINS }}" ]; then
+            CDN_COUNT=$(echo "${{ secrets.CDN_DOMAINS }}" | wc -w)
+            CDN_INFO="\n- **CDN域名数**: $CDN_COUNT 个"
+          fi
+          
+          FULL_MESSAGE="$EMOJI **SSL证书自动化任务通知**\n\n- **状态**: $STATUS\n- **时间**: $TIMESTAMP\n- **CA**: ZeroSSL (默认)\n- **仓库**: ${{ github.repository }}$DOMAIN_INFO$CDN_INFO\n- **详情**: $MESSAGE\n- **运行ID**: ${{ github.run_id }}"
+          
+          # 企业微信通知
+          if [ -n "$WECHAT_WEBHOOK" ]; then
+            curl -X POST "$WECHAT_WEBHOOK" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"msgtype\": \"markdown\",
+                \"markdown\": {
+                  \"content\": \"$FULL_MESSAGE\"
+                }
+              }" && echo "企业微信通知发送成功" || echo "企业微信通知发送失败"
+          fi
