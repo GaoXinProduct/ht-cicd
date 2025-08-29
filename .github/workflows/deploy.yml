@@ -1,4 +1,4 @@
-name: acme申请证书自动上传到阿里云cdn
+name: ht-cicd
 
 on:
   schedule:
